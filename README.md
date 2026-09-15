@@ -336,6 +336,7 @@ const val CHUNK_SIZE = 1 shl 20           // 1 MB
 
 - **JVM**：OpenJDK 11 及以上
 - **编译**：Kotlin 1.6 及以上
+-   测试版本:Kotlin version 2.4.20 (JRE 21.0.12)
 - **平台**：Android/Termux、Linux、macOS（未在 Windows 测试）
 - **tar 格式**：USTAR + PAX 扩展头，兼容 GNU tar、bsdtar、Python tarfile
 
