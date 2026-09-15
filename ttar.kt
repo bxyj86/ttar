@@ -30,7 +30,7 @@ data class Item(
     val arcname: String,
     val isDir: Boolean,
     val isSymlink: Boolean,
-    val linkTarget: String?,   // 仅 symlink 有值
+    val linkTarget: String?,
     val size: Long,
     val mode: Int,
     val mtime: Long
@@ -51,6 +51,40 @@ fun fmtTime(sec: Double): String {
     val h = m / 60
     val mm = m % 60
     return "$h 时 $mm 分 %.2f 秒".format(s)
+}
+
+/** 从路径字符串取 basename，兼容尾随斜杠 */
+fun basename(p: String): String {
+    var s = p.trimEnd('/', '\\')
+    if (s.isEmpty()) s = p
+    val idx = maxOf(s.lastIndexOf('/'), s.lastIndexOf('\\'))
+    return if (idx >= 0) s.substring(idx + 1) else s
+}
+
+fun printUsage() {
+    System.err.println(
+        """
+用法: java -jar ttar.jar <paths...> [-o <output.tar>] [-j workers] [-w window]
+
+参数:
+  <paths...>        要打包的文件或目录（可多个）
+  -o, --output      输出 tar 路径；省略则自动推断
+  -j, --workers     读取线程数（默认 8）
+  -w, --window      预取窗口（默认 workers*2）
+  -h, --help        显示帮助
+
+输出路径推断规则:
+  1. 给了 -o/--output，用它
+  2. 最后一个参数以 .tar 结尾（且参数数 > 1），当作输出
+  3. 都没有，输出到 ./<第一个输入的 basename>.tar
+
+示例:
+  java -jar ttar.jar ./人设/
+  java -jar ttar.jar ./人设/ ./其他/
+  java -jar ttar.jar ./人设/ 人设.tar
+  java -jar ttar.jar ./人设/ -o /tmp/人设.tar
+        """.trimIndent()
+    )
 }
 
 // ---------- USTAR / PAX ----------
@@ -101,7 +135,6 @@ fun makeHeader(
     writeOctal(h, 136, 11, mtime)
     for (i in 148 until 156) h[i] = ' '.code.toByte()
 
-    // typeflag：显式传入优先，其次根据 linkname / isDir 推断
     h[156] = when {
         typeflag != null -> typeflag.toByte()
         linkname != null -> TF_LNK.toByte()
@@ -120,7 +153,6 @@ fun makeHeader(
 
     if (prefix.isNotEmpty()) System.arraycopy(prefix, 0, h, 345, prefix.size)
 
-    // linkname 字段：offset 157，长度 100
     if (linkname != null) {
         val lb = linkname.toByteArray(Charsets.UTF_8)
         val n = minOf(lb.size, 100)
@@ -150,10 +182,6 @@ fun paxLine(key: String, value: String): ByteArray {
     }
 }
 
-/**
- * 构造 PAX 扩展头。pathValue / linkValue 各自可为 null，
- * 只有非 null 的项才会写入。
- */
 fun makePaxEntry(pathValue: String?, linkValue: String?, mtime: Long): ByteArray {
     var content = ByteArray(0)
     if (pathValue != null) content += paxLine("path", pathValue)
@@ -182,7 +210,6 @@ fun walkDir(root: File, arcRoot: String, items: MutableList<Item>) {
         val arc = "$arcRoot/${child.name}"
         val nio = child.toPath()
 
-        // 关键：先判 symlink，避免 isDirectory / isFile 跟随链接
         if (Files.isSymbolicLink(nio)) {
             val target = try {
                 Files.readSymbolicLink(nio).toString()
@@ -194,7 +221,7 @@ fun walkDir(root: File, arcRoot: String, items: MutableList<Item>) {
             items.add(Item(child, arc, isDir = true, isSymlink = false,
                           linkTarget = null, size = 0,
                           mode = MODE_DIR, mtime = child.lastModified() / 1000))
-            walkDir(child, arc, items)   // 只在真实目录里递归
+            walkDir(child, arc, items)
         } else if (child.isFile) {
             items.add(Item(child, arc, isDir = false, isSymlink = false,
                           linkTarget = null, size = child.length(),
@@ -243,7 +270,7 @@ fun packFast(
     workers: Int = DEFAULT_WORKERS, window: Int = 0
 ): Stats {
     val t0total = System.nanoTime()
-    val arcs = arcnames ?: paths.map { File(it).name }
+    val arcs = arcnames ?: paths.map { basename(it) }
     if (paths.size != arcs.size) throw IllegalArgumentException("paths 与 arcnames 数量不一致")
     val win = if (window > 0) window else maxOf(workers * 2, 8)
 
@@ -275,7 +302,6 @@ fun packFast(
     try {
         BufferedOutputStream(FileOutputStream(outputPath), 1 shl 20).use { out ->
             val itemsIt = items.iterator()
-            // future == null 表示：目录 / symlink / 大文件（主线程自己处理）
             val queue = ArrayDeque<Pair<Item, Future<ByteArray>?>>()
 
             fun submit(item: Item): Future<ByteArray>? {
@@ -314,7 +340,6 @@ fun packFast(
                             val pax = makePaxEntry(paxName, paxLink, item.mtime)
                             out.write(pax); written += pax.size; paxCount++
                         }
-                        // size = 0，linkname 放目标路径，typeflag = '2'
                         val hdr = makeHeader(arcname, 0, item.mode, item.mtime,
                                              isDir = false, linkname = target)
                         out.write(hdr); written += hdr.size
@@ -330,13 +355,11 @@ fun packFast(
                         out.write(hdr); written += hdr.size
 
                         if (fut != null) {
-                            // 小文件：用预读好的字节
                             val data = fut.get()
                             out.write(data); written += data.size
                             val pad = (512 - (data.size % 512)) % 512
                             if (pad > 0) { out.write(zeros, 0, pad); written += pad }
                         } else {
-                            // 大文件：主线程分块流式读 + 写
                             FileInputStream(item.path).use { s ->
                                 while (true) {
                                     val n = s.read(chunkBuf)
@@ -384,7 +407,7 @@ fun packFast(
 // ---------- main ----------
 fun main(args: Array<String>) {
     if (args.isEmpty()) {
-        System.err.println("用法: java -jar ttar.jar <paths...> -o <output.tar> [-j workers] [-w window]")
+        printUsage()
         exitProcess(1)
     }
     val paths = mutableListOf<String>()
@@ -398,14 +421,26 @@ fun main(args: Array<String>) {
             "-o", "--output" -> { i++; outputPath = args.getOrNull(i) }
             "-j", "--workers" -> { i++; workers = args.getOrNull(i)?.toIntOrNull() ?: DEFAULT_WORKERS }
             "-w", "--window" -> { i++; window = args.getOrNull(i)?.toIntOrNull() ?: 0 }
+            "-h", "--help" -> { printUsage(); exitProcess(0) }
             else -> paths.add(args[i])
         }
         i++
     }
 
-    if (paths.isEmpty() || outputPath == null) {
-        System.err.println("必须指定输入路径和 -o 输出路径")
+    if (paths.isEmpty()) {
+        printUsage()
         exitProcess(1)
+    }
+
+    // 智能推断输出路径
+    if (outputPath == null) {
+        // 规则 2：最后一个参数以 .tar 结尾（且参数数 > 1），当作输出
+        if (paths.size > 1 && paths.last().endsWith(".tar", ignoreCase = true)) {
+            outputPath = paths.removeAt(paths.size - 1)
+        } else {
+            // 规则 3：默认输出到当前目录
+            outputPath = "./${basename(paths.first())}.tar"
+        }
     }
 
     val stat = packFast(paths, outputPath, workers = workers, window = window)
