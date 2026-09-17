@@ -5,6 +5,8 @@ import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.ArrayDeque
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
@@ -15,15 +17,20 @@ const val DEFAULT_WORKERS = 8
 const val DEFAULT_WINDOW = 16
 const val BIGFILE_THRESHOLD = 8L shl 20   // 8 MB 以上走流式
 const val CHUNK_SIZE = 1 shl 20            // 流式读块大小 1 MB
+const val PROGRESS_INTERVAL_MS = 100L      // 进度回调最小间隔
 
 const val MODE_FILE = 420      // 0o644
 const val MODE_DIR = 493       // 0o755
 const val MODE_SYMLINK = 511   // 0o777
 
-const val TF_REG = 0x30   // '0' 普通文件
-const val TF_DIR = 0x35   // '5' 目录
-const val TF_LNK = 0x32   // '2' 符号链接
-const val TF_PAX = 0x78   // 'x' PAX 扩展头
+const val TF_REG = 0x30
+const val TF_DIR = 0x35
+const val TF_LNK = 0x32
+const val TF_PAX = 0x78
+
+// tar 结束块，全局只分配一次
+private val TAR_END = ByteArray(1024)
+private val ZEROS_512 = ByteArray(512)
 
 data class Item(
     val path: File,
@@ -53,7 +60,6 @@ fun fmtTime(sec: Double): String {
     return "$h 时 $mm 分 %.2f 秒".format(s)
 }
 
-/** 从路径字符串取 basename，兼容尾随斜杠 */
 fun basename(p: String): String {
     var s = p.trimEnd('/', '\\')
     if (s.isEmpty()) s = p
@@ -203,29 +209,47 @@ fun needsPaxName(name: String): Boolean {
 fun needsPaxLink(target: String): Boolean =
     target.toByteArray(Charsets.UTF_8).size > 100
 
-// ---------- 扫描 ----------
-fun walkDir(root: File, arcRoot: String, items: MutableList<Item>) {
+// ---------- 扫描（用 readAttributes 一次性拿全部属性） ----------
+
+/** 一次系统调用拿到 size/mtime/类型，避免 File API 的多次 stat。 */
+private fun readAttrs(f: File): BasicFileAttributes? =
+    try {
+        Files.readAttributes(
+            f.toPath(),
+            BasicFileAttributes::class.java,
+            LinkOption.NOFOLLOW_LINKS
+        )
+    } catch (e: Exception) { null }
+
+private fun mkItem(
+    f: File, arc: String, attrs: BasicFileAttributes,
+    isSymlink: Boolean
+): Item {
+    val linkTarget = if (isSymlink) {
+        try { Files.readSymbolicLink(f.toPath()).toString() } catch (e: Exception) { "" }
+    } else null
+
+    return when {
+        isSymlink -> Item(f, arc, false, true, linkTarget, 0,
+                          MODE_SYMLINK, attrs.lastModifiedTime().toMillis() / 1000)
+        attrs.isDirectory -> Item(f, arc, true, false, null, 0,
+                                  MODE_DIR, attrs.lastModifiedTime().toMillis() / 1000)
+        else -> Item(f, arc, false, false, null, attrs.size(),
+                     MODE_FILE, attrs.lastModifiedTime().toMillis() / 1000)
+    }
+}
+
+private fun walkDir(root: File, arcRoot: String, items: MutableList<Item>) {
     val children = root.listFiles() ?: return
     for (child in children) {
+        val attrs = readAttrs(child) ?: continue
         val arc = "$arcRoot/${child.name}"
-        val nio = child.toPath()
+        val isLink = attrs.isSymbolicLink
 
-        if (Files.isSymbolicLink(nio)) {
-            val target = try {
-                Files.readSymbolicLink(nio).toString()
-            } catch (e: Exception) { "" }
-            items.add(Item(child, arc, isDir = false, isSymlink = true,
-                          linkTarget = target, size = 0,
-                          mode = MODE_SYMLINK, mtime = child.lastModified() / 1000))
-        } else if (child.isDirectory) {
-            items.add(Item(child, arc, isDir = true, isSymlink = false,
-                          linkTarget = null, size = 0,
-                          mode = MODE_DIR, mtime = child.lastModified() / 1000))
+        items.add(mkItem(child, arc, attrs, isLink))
+
+        if (!isLink && attrs.isDirectory) {
             walkDir(child, arc, items)
-        } else if (child.isFile) {
-            items.add(Item(child, arc, isDir = false, isSymlink = false,
-                          linkTarget = null, size = child.length(),
-                          mode = MODE_FILE, mtime = child.lastModified() / 1000))
         }
     }
 }
@@ -234,31 +258,14 @@ fun scan(paths: List<String>, arcnames: List<String>): List<Item> {
     val items = mutableListOf<Item>()
     for ((src, arcbase) in paths.zip(arcnames)) {
         val f = File(src).absoluteFile
-        val nio = f.toPath()
+        val attrs = readAttrs(f)
+            ?: throw FileNotFoundException(src)
+        val isLink = attrs.isSymbolicLink
 
-        val isLink = Files.isSymbolicLink(nio)
-        if (!f.exists() && !isLink) throw FileNotFoundException(src)
+        items.add(mkItem(f, arcbase, attrs, isLink))
 
-        when {
-            isLink -> {
-                val target = try {
-                    Files.readSymbolicLink(nio).toString()
-                } catch (e: Exception) { "" }
-                items.add(Item(f, arcbase, isDir = false, isSymlink = true,
-                              linkTarget = target, size = 0,
-                              mode = MODE_SYMLINK, mtime = f.lastModified() / 1000))
-            }
-            f.isDirectory -> {
-                items.add(Item(f, arcbase, isDir = true, isSymlink = false,
-                              linkTarget = null, size = 0,
-                              mode = MODE_DIR, mtime = f.lastModified() / 1000))
-                walkDir(f, arcbase, items)
-            }
-            f.isFile -> {
-                items.add(Item(f, arcbase, isDir = false, isSymlink = false,
-                              linkTarget = null, size = f.length(),
-                              mode = MODE_FILE, mtime = f.lastModified() / 1000))
-            }
+        if (!isLink && attrs.isDirectory) {
+            walkDir(f, arcbase, items)
         }
     }
     return items
@@ -294,9 +301,9 @@ fun packFast(
     var totalBytes = 0L
     var paxCount = 0
     var written = 0L
+    var lastReport = 0L
 
     val chunkBuf = ByteArray(CHUNK_SIZE)
-    val zeros = ByteArray(512)
 
     val ex = Executors.newFixedThreadPool(workers)
     try {
@@ -304,10 +311,29 @@ fun packFast(
             val itemsIt = items.iterator()
             val queue = ArrayDeque<Pair<Item, Future<ByteArray>?>>()
 
+            // 队列中已提交任务的字节数上限：堆的 70%，64 MB ~ 320 MB
+            val rt = Runtime.getRuntime()
+            val availHeap = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())
+            val pendingByteLimit = (availHeap * 70 / 100)
+                .coerceIn(64L * 1024 * 1024, 320L * 1024 * 1024)
+            var pendingBytes = 0L
+
             fun submit(item: Item): Future<ByteArray>? {
                 if (item.isDir || item.isSymlink) return null
                 if (item.size > BIGFILE_THRESHOLD) return null
+                if (pendingBytes + item.size > pendingByteLimit) return null
+                pendingBytes += item.size
                 return ex.submit(Callable { item.path.readBytes() })
+            }
+
+            fun report(force: Boolean) {
+                val now = System.nanoTime() / 1_000_000
+                if (force || now - lastReport >= PROGRESS_INTERVAL_MS) {
+                    val dt = (System.nanoTime() - t0pack) / 1e9
+                    val speed = if (dt > 0) done / dt else 0.0
+                    System.err.print("\r进度 $done/$total  ${"%.0f".format(speed)} 项/秒")
+                    lastReport = now
+                }
             }
 
             repeat(win) {
@@ -356,9 +382,10 @@ fun packFast(
 
                         if (fut != null) {
                             val data = fut.get()
+                            pendingBytes -= item.size
                             out.write(data); written += data.size
-                            val pad = (512 - (data.size % 512)) % 512
-                            if (pad > 0) { out.write(zeros, 0, pad); written += pad }
+                            val pad = (512 - (data.size and 511)) and 511
+                            if (pad > 0) { out.write(ZEROS_512, 0, pad); written += pad }
                         } else {
                             FileInputStream(item.path).use { s ->
                                 while (true) {
@@ -368,19 +395,15 @@ fun packFast(
                                     written += n
                                 }
                             }
-                            val pad = (512 - (item.size % 512).toInt()) % 512
-                            if (pad > 0) { out.write(zeros, 0, pad); written += pad }
+                            val pad = (512 - (item.size.toInt() and 511)) and 511
+                            if (pad > 0) { out.write(ZEROS_512, 0, pad); written += pad }
                         }
                         totalBytes += item.size
                     }
                 }
 
                 done++
-                if (done % 500 == 0 || done == total) {
-                    val dt = (System.nanoTime() - t0pack) / 1e9
-                    val speed = if (dt > 0) done / dt else 0.0
-                    System.err.print("\r进度 $done/$total  ${"%.0f".format(speed)} 项/秒")
-                }
+                report(done == total)
 
                 if (itemsIt.hasNext()) {
                     val nxt = itemsIt.next()
@@ -388,7 +411,7 @@ fun packFast(
                 }
             }
 
-            out.write(ByteArray(1024))
+            out.write(TAR_END)
             written += 1024
         }
     } finally {
@@ -406,10 +429,8 @@ fun packFast(
 
 // ---------- main ----------
 fun main(args: Array<String>) {
-    if (args.isEmpty()) {
-        printUsage()
-        exitProcess(1)
-    }
+    if (args.isEmpty()) { printUsage(); exitProcess(1) }
+
     val paths = mutableListOf<String>()
     var outputPath: String? = null
     var workers = DEFAULT_WORKERS
@@ -418,29 +439,55 @@ fun main(args: Array<String>) {
     var i = 0
     while (i < args.size) {
         when (args[i]) {
-            "-o", "--output" -> { i++; outputPath = args.getOrNull(i) }
-            "-j", "--workers" -> { i++; workers = args.getOrNull(i)?.toIntOrNull() ?: DEFAULT_WORKERS }
-            "-w", "--window" -> { i++; window = args.getOrNull(i)?.toIntOrNull() ?: 0 }
+            "-o", "--output" -> {
+                i++
+                val v = args.getOrNull(i)
+                if (v == null) {
+                    System.err.println("错误：${args[i-1]} 后面缺少参数")
+                    exitProcess(2)
+                }
+                outputPath = v
+            }
+            "-j", "--workers" -> {
+                i++
+                val v = args.getOrNull(i)?.toIntOrNull()
+                if (v == null || v < 1) {
+                    System.err.println("错误：-j 需要一个正整数")
+                    exitProcess(2)
+                }
+                workers = v
+            }
+            "-w", "--window" -> {
+                i++
+                val v = args.getOrNull(i)?.toIntOrNull()
+                if (v == null || v < 1) {
+                    System.err.println("错误：-w 需要一个正整数")
+                    exitProcess(2)
+                }
+                window = v
+            }
             "-h", "--help" -> { printUsage(); exitProcess(0) }
             else -> paths.add(args[i])
         }
         i++
     }
 
-    if (paths.isEmpty()) {
-        printUsage()
-        exitProcess(1)
-    }
+    if (paths.isEmpty()) { printUsage(); exitProcess(1) }
 
-    // 智能推断输出路径
+    // 输出路径推断
     if (outputPath == null) {
-        // 规则 2：最后一个参数以 .tar 结尾（且参数数 > 1），当作输出
         if (paths.size > 1 && paths.last().endsWith(".tar", ignoreCase = true)) {
             outputPath = paths.removeAt(paths.size - 1)
         } else {
-            // 规则 3：默认输出到当前目录
             outputPath = "./${basename(paths.first())}.tar"
         }
+    }
+
+    // 校验输出父目录存在
+    val outParent = File(outputPath).absoluteFile.parentFile
+    if (outParent != null && !outParent.exists()) {
+        System.err.println("错误：输出目录不存在 - ${outParent.absolutePath}")
+        exitProcess(2)
     }
 
     val stat = packFast(paths, outputPath, workers = workers, window = window)
