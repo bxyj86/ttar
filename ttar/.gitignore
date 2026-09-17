@@ -1,0 +1,18 @@
+# 构建产物
+build/
+app/build/
+.gradle/
+
+# IDE
+.idea/
+*.iml
+local.properties
+captures/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 签名
+*.jks
+*.keystore
