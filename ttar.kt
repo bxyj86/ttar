@@ -85,10 +85,10 @@ fun printUsage() {
   3. 都没有，输出到 ./<第一个输入的 basename>.tar
 
 示例:
-  java -jar ttar.jar ./人设/
-  java -jar ttar.jar ./人设/ ./其他/
-  java -jar ttar.jar ./人设/ 人设.tar
-  java -jar ttar.jar ./人设/ -o /tmp/人设.tar
+  java -jar ttar.jar ./文件夹/
+  java -jar ttar.jar ./文件夹/ ./其他/
+  java -jar ttar.jar ./文件夹/ 文件名.tar
+  java -jar ttar.jar ./文件夹/ -o /tmp/文件名.tar
         """.trimIndent()
     )
 }
