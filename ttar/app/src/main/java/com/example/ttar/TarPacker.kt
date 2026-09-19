@@ -11,6 +11,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 
 private const val BLOCK = 512
+/** USTAR size 字段上限：11 位八进制 = 8^11 - 1 字节 */
+private const val USTAR_SIZE_MAX = 8_589_934_591L
 private const val MODE_FILE = 420
 private const val MODE_DIR = 493
 private const val MODE_SYMLINK = 511
@@ -52,10 +54,25 @@ data class PackStats(
 
 class TarPacker {
 
+    /** 只做扫描，返回条目列表。供 UI 缓存后复用。 */
+    fun scanOnly(
+        sourcePath: String,
+        options: Options = Options(),
+        onScanProgress: (found: Int) -> Unit = {}
+    ): List<Item> {
+        val source = File(sourcePath)
+        if (!source.exists()) throw IllegalArgumentException("源不存在: $sourcePath")
+        val rootName = source.name.ifEmpty { "root" }
+        val items = mutableListOf<Item>()
+        scan(source, rootName, items, options, onScanProgress)
+        return items
+    }
+
     fun pack(
         sourcePath: String,
         outputPath: String,
         options: Options = Options(),
+        preScannedItems: List<Item>? = null,
         onScanProgress: (found: Int) -> Unit = {},
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
     ): PackStats {
@@ -67,10 +84,15 @@ class TarPacker {
         val output = File(outputPath)
         output.parentFile?.mkdirs()
 
-        // ---- 扫描 ----
-        val rootName = source.name.ifEmpty { "root" }
-        val items = mutableListOf<Item>()
-        scan(source, rootName, items, options, onScanProgress)
+        // ---- 扫描（或复用外部传入的结果）----
+        val items: List<Item> = if (preScannedItems != null) {
+            preScannedItems
+        } else {
+            val rootName = source.name.ifEmpty { "root" }
+            val tmp = mutableListOf<Item>()
+            scan(source, rootName, tmp, options, onScanProgress)
+            tmp
+        }
 
         // ---- 内存采样 ----
         fun usedHeap(): Long {
@@ -179,11 +201,18 @@ class TarPacker {
                             }
                         }
                         else -> {
-                            if (needsPaxName(arcname)) {
-                                val pax = makePaxEntry(arcname, null, item.mtime)
+                            val needPaxSize = item.size > USTAR_SIZE_MAX
+                            val needPaxPath = needsPaxName(arcname)
+                            if (needPaxSize || needPaxPath) {
+                                val pax = makePaxEntry(
+                                    if (needPaxPath) arcname else null,
+                                    null, item.mtime,
+                                    if (needPaxSize) item.size else null
+                                )
                                 bos.write(pax); written += pax.size; paxCount++
                             }
-                            val hdr = makeHeader(arcname, item.size, item.mode, item.mtime, isDir = false)
+                            val hdrSize = if (needPaxSize) 0L else item.size
+                            val hdr = makeHeader(arcname, hdrSize, item.mode, item.mtime, isDir = false)
                             bos.write(hdr); written += hdr.size
 
                             if (fut != null) {
@@ -360,10 +389,12 @@ class TarPacker {
         }
     }
 
-    private fun makePaxEntry(pathValue: String?, linkValue: String?, mtime: Long): ByteArray {
+    private fun makePaxEntry(pathValue: String?, linkValue: String?, mtime: Long,
+                             sizeValue: Long? = null): ByteArray {
         var content = ByteArray(0)
         if (pathValue != null) content += paxLine("path", pathValue)
         if (linkValue != null) content += paxLine("linkpath", linkValue)
+        if (sizeValue != null) content += paxLine("size", sizeValue.toString())
         val hdr = makeHeader("PaxHeaders/entry", content.size.toLong(),
                              MODE_FILE, mtime, isDir = false, typeflag = TF_PAX)
         val pad = (BLOCK - content.size % BLOCK) % BLOCK

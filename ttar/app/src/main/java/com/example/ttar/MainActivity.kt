@@ -16,12 +16,7 @@ import android.view.View
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.*
 import java.io.File
 
 class MainActivity : BaseActivity() {
@@ -30,23 +25,30 @@ class MainActivity : BaseActivity() {
     private lateinit var outputInput: EditText
     private lateinit var statusView: TextView
     private lateinit var permLine: TextView
+    private lateinit var btnScan: TextView
+    private lateinit var btnPack: TextView
 
-    // ─── 跨线程进度状态 ───
-    @Volatile private var phase = "idle"    // idle / scan / pack / done / fail
+    private var lastScannedSource: String? = null
+    private var cachedItems: List<Item>? = null
+
+    @Volatile private var phase = "idle"
     @Volatile private var scanCount = 0
     @Volatile private var doneCount = 0
     @Volatile private var totalCount = 0
     @Volatile private var finalLine = ""
     @Volatile private var t0 = 0L
-
     private var timerJob: Job? = null
+    private var busy = false
 
     private val pickSource = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
         uri?.let {
-            uriToRealPath(it)?.let { p -> sourceInput.setText(p); setStatus("已选源：$p") }
-                ?: setStatus("无法解析路径，请手动输入")
+            uriToRealPath(it)?.let { p ->
+                sourceInput.setText(p)
+                invalidateCache()
+                setStatus("已选源：$p")
+            } ?: setStatus("无法解析路径，请手动输入")
         }
     }
 
@@ -75,15 +77,12 @@ class MainActivity : BaseActivity() {
             setPadding(dp(20), dp(16), dp(20), dp(16))
         }
         topBar.addView(TextView(ctx).apply {
-            text = "ttar"
-            textSize = 20f
-            setTypeface(null, Typeface.BOLD)
+            text = "ttar"; textSize = 20f; setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
         topBar.addView(TextView(ctx).apply {
-            text = "设置"
-            textSize = 16f
+            text = "设置"; textSize = 16f
             setPadding(dp(12), dp(8), 0, dp(8))
             setOnClickListener {
                 startActivity(Intent(ctx, SettingsActivity::class.java))
@@ -93,22 +92,25 @@ class MainActivity : BaseActivity() {
         root.addView(divider())
 
         permLine = TextView(ctx).apply {
-            textSize = 14f
-            setPadding(dp(20), dp(16), dp(20), dp(8))
+            textSize = 14f; setPadding(dp(20), dp(16), dp(20), dp(8))
         }
         root.addView(permLine)
-
         root.addView(TextView(ctx).apply {
-            text = "授予所有文件访问权限"
-            textSize = 14f
+            text = "授予所有文件访问权限"; textSize = 14f
             setPadding(dp(20), dp(4), dp(20), dp(16))
             setOnClickListener { requestAllFilesAccess() }
         })
-
         root.addView(divider())
 
         root.addView(sectionLabel("源目录"))
         sourceInput = pathInput(opts.defaultSource)
+        sourceInput.addTextChangedListener(object : android.text.TextWatcher {
+            override fun afterTextChanged(s: android.text.Editable?) {
+                if (s?.toString()?.trim() != lastScannedSource) invalidateCache()
+            }
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+        })
         root.addView(inputRow(sourceInput, "选择") { pickSource.launch(null) })
 
         root.addView(sectionLabel("输出 tar"))
@@ -117,14 +119,33 @@ class MainActivity : BaseActivity() {
             pickOutput.launch(opts.defaultOutputName)
         })
 
-        root.addView(TextView(ctx).apply {
-            text = "开始打包"
-            textSize = 17f
+        val btnRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+        }
+        btnScan = TextView(ctx).apply {
+            text = "开始扫描"; textSize = 17f
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
-            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setPadding(dp(12), dp(14), dp(12), dp(14))
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            ).apply { marginEnd = dp(10) }
+            setOnClickListener { startScan() }
+        }
+        btnPack = TextView(ctx).apply {
+            text = "开始打包"; textSize = 17f
+            setTypeface(null, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(14), dp(12), dp(14))
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            ).apply { marginStart = dp(10) }
             setOnClickListener { startPack() }
-        })
+        }
+        btnRow.addView(btnScan)
+        btnRow.addView(btnPack)
+        root.addView(btnRow)
 
         root.addView(divider())
 
@@ -135,32 +156,27 @@ class MainActivity : BaseActivity() {
         }
         root.addView(statusView)
 
-        val scroll = ScrollView(ctx).apply { addView(root) }
-        setContentView(scroll)
-
+        setContentView(ScrollView(ctx).apply { addView(root) })
         updatePermissionStatus()
         setStatus("就绪")
     }
 
     override fun onPause() {
         super.onPause()
-        // 离开界面时停掉计时协程，避免泄漏
-        timerJob?.cancel()
-        timerJob = null
+        timerJob?.cancel(); timerJob = null
     }
 
     override fun onResume() {
         super.onResume()
         updatePermissionStatus()
+        if (busy) startTimerLoop()
     }
 
-    private fun isDark(): Boolean {
-        val mode = resources.configuration.uiMode and
-                android.content.res.Configuration.UI_MODE_NIGHT_MASK
-        return mode == android.content.res.Configuration.UI_MODE_NIGHT_YES
-    }
+    private fun isDark() = (resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun divider(): View = View(this).apply {
         layoutParams = LinearLayout.LayoutParams(
@@ -169,14 +185,12 @@ class MainActivity : BaseActivity() {
     }
 
     private fun sectionLabel(t: String): TextView = TextView(this).apply {
-        text = t
-        textSize = 13f
+        text = t; textSize = 13f
         setPadding(dp(20), dp(20), dp(20), dp(6))
     }
 
     private fun pathInput(v: String): EditText = EditText(this).apply {
-        setText(v)
-        textSize = 15f
+        setText(v); textSize = 15f
         inputType = InputType.TYPE_CLASS_TEXT
         setBackgroundColor(Color.TRANSPARENT)
         setPadding(dp(20), dp(8), dp(20), dp(8))
@@ -191,26 +205,34 @@ class MainActivity : BaseActivity() {
         }
         row.addView(edit)
         row.addView(TextView(this).apply {
-            text = btnText
-            textSize = 15f
+            text = btnText; textSize = 15f
             setPadding(dp(12), dp(12), dp(20), dp(12))
             setOnClickListener { onClick() }
         })
         return row
     }
 
-    private fun setStatus(s: String) {
-        statusView.text = s
+    private fun setStatus(s: String) { statusView.text = s }
+
+    private fun invalidateCache() {
+        lastScannedSource = null
+        cachedItems = null
     }
 
-    private fun hasAllFilesAccess(): Boolean =
+    private fun setButtonsEnabled(enabled: Boolean) {
+        btnScan.isEnabled = enabled
+        btnPack.isEnabled = enabled
+        val alpha = if (enabled) 1f else 0.4f
+        btnScan.alpha = alpha
+        btnPack.alpha = alpha
+    }
+
+    private fun hasAllFilesAccess() =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
-            Environment.isExternalStorageManager()
-        else true
+            Environment.isExternalStorageManager() else true
 
     private fun updatePermissionStatus() {
-        permLine.text = if (hasAllFilesAccess()) "权限：已授予"
-                        else "权限：未授予"
+        permLine.text = if (hasAllFilesAccess()) "权限：已授予" else "权限：未授予"
     }
 
     private fun requestAllFilesAccess() {
@@ -218,8 +240,7 @@ class MainActivity : BaseActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val i = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
             i.data = Uri.parse("package:$packageName")
-            try { startActivity(i) }
-            catch (e: Exception) {
+            try { startActivity(i) } catch (e: Exception) {
                 startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
             }
         }
@@ -244,14 +265,11 @@ class MainActivity : BaseActivity() {
             return File(Environment.getExternalStorageDirectory(), rel).absolutePath
         }
         val idx = docId.indexOf(':')
-        if (idx > 0) {
-            return "/storage/${docId.substring(0, idx)}/${docId.substring(idx + 1)}"
-        }
+        if (idx > 0) return "/storage/${docId.substring(0, idx)}/${docId.substring(idx + 1)}"
         return null
     }
 
-    private fun fmtMb(bytes: Long): String =
-        "%.0f MB".format(bytes / 1024.0 / 1024.0)
+    private fun fmtMb(bytes: Long) = "%.0f MB".format(bytes / 1024.0 / 1024.0)
 
     private fun fmtSize(bytes: Long): String =
         if (bytes < 1024L * 1024L * 1024L)
@@ -259,11 +277,6 @@ class MainActivity : BaseActivity() {
         else
             "%.2f GB".format(bytes / 1024.0 / 1024.0 / 1024.0)
 
-    /**
-     * 启动一个独立的计时协程，每 100ms 刷一次显示。
-     * 每次刷新都重新读 SystemClock.elapsedRealtime()，
-     * 即使某次刷新被 UI 阻塞延迟，下一次也会立刻追上真实时间。
-     */
     private fun startTimerLoop() {
         timerJob?.cancel()
         timerJob = lifecycleScope.launch(Dispatchers.Main) {
@@ -275,8 +288,7 @@ class MainActivity : BaseActivity() {
                         val pct = if (totalCount > 0) doneCount * 100 / totalCount else 0
                         "打包中  $doneCount / $totalCount  ($pct%)    ${"%.1f".format(elapsed)}s"
                     }
-                    "done" -> finalLine
-                    "fail" -> finalLine
+                    "done", "fail" -> finalLine
                     else -> "准备中…    ${"%.1f".format(elapsed)}s"
                 }
                 statusView.text = text
@@ -285,30 +297,61 @@ class MainActivity : BaseActivity() {
         }
     }
 
-    private fun startPack() {
-        if (!hasAllFilesAccess()) {
-            setStatus("请先授予所有文件访问权限")
-            return
-        }
+    private fun startScan() {
+        if (busy) return
+        if (!hasAllFilesAccess()) { setStatus("请先授予所有文件访问权限"); return }
         val src = sourceInput.text.toString().trim()
-        val out = outputInput.text.toString().trim()
-        if (src.isEmpty() || out.isEmpty()) {
-            setStatus("请填写源目录和输出路径")
-            return
-        }
-        if (!File(src).exists()) {
-            setStatus("源不存在：$src")
-            return
-        }
+        if (src.isEmpty()) { setStatus("请填写源目录"); return }
+        if (!File(src).exists()) { setStatus("源不存在：$src"); return }
 
         val opts = Options.load(this)
+        busy = true
+        setButtonsEnabled(false)
+        phase = "scan"; scanCount = 0; finalLine = ""
+        t0 = SystemClock.elapsedRealtime()
+        startTimerLoop()
 
-        // 重置状态，启动计时
-        phase = "scan"
-        scanCount = 0
-        doneCount = 0
-        totalCount = 0
-        finalLine = ""
+        lifecycleScope.launch {
+            try {
+                val items = withContext(Dispatchers.IO) {
+                    TarPacker().scanOnly(src, opts) { n ->
+                        phase = "scan"; scanCount = n
+                    }
+                }
+                cachedItems = items
+                lastScannedSource = src
+                val wall = (SystemClock.elapsedRealtime() - t0) / 1000.0
+                finalLine = "扫描完成  ${items.size} 项    ${"%.2f".format(wall)}s\n$src"
+                phase = "done"
+                timerJob?.cancel()
+                statusView.text = finalLine
+            } catch (e: Exception) {
+                finalLine = "扫描失败：${e.message}"
+                phase = "fail"
+                timerJob?.cancel()
+                statusView.text = finalLine
+            } finally {
+                busy = false
+                setButtonsEnabled(true)
+            }
+        }
+    }
+
+    private fun startPack() {
+        if (busy) return
+        if (!hasAllFilesAccess()) { setStatus("请先授予所有文件访问权限"); return }
+        val src = sourceInput.text.toString().trim()
+        val out = outputInput.text.toString().trim()
+        if (src.isEmpty() || out.isEmpty()) { setStatus("请填写源目录和输出路径"); return }
+        if (!File(src).exists()) { setStatus("源不存在：$src"); return }
+
+        val opts = Options.load(this)
+        val preScanned = if (src == lastScannedSource) cachedItems else null
+
+        busy = true
+        setButtonsEnabled(false)
+        phase = if (preScanned != null) "pack" else "scan"
+        scanCount = 0; doneCount = 0; totalCount = 0; finalLine = ""
         t0 = SystemClock.elapsedRealtime()
         startTimerLoop()
 
@@ -317,16 +360,10 @@ class MainActivity : BaseActivity() {
                 val stats = withContext(Dispatchers.IO) {
                     TarPacker().pack(
                         src, out, opts,
-                        onScanProgress = { n ->
-                            // 只更新变量，不碰 UI
-                            phase = "scan"
-                            scanCount = n
-                        },
+                        preScannedItems = preScanned,
+                        onScanProgress = { n -> phase = "scan"; scanCount = n },
                         onProgress = { d, t ->
-                            // 只更新变量，不碰 UI
-                            phase = "pack"
-                            doneCount = d
-                            totalCount = t
+                            phase = "pack"; doneCount = d; totalCount = t
                         }
                     )
                 }
@@ -347,6 +384,9 @@ class MainActivity : BaseActivity() {
                 phase = "fail"
                 timerJob?.cancel()
                 statusView.text = finalLine
+            } finally {
+                busy = false
+                setButtonsEnabled(true)
             }
         }
     }
