@@ -19,6 +19,11 @@ const val BIGFILE_THRESHOLD = 8L shl 20   // 8 MB 以上走流式
 const val CHUNK_SIZE = 1 shl 20            // 流式读块大小 1 MB
 const val PROGRESS_INTERVAL_MS = 100L      // 进度回调最小间隔
 
+/** USTAR size 字段上限：11 位八进制 = 8^11 - 1 字节（约 8 GiB）
+ *  超过此值的文件必须在 PAX 扩展头里记录真实 size，
+ *  否则 header 里的八进制字符串会被截断，导致 tar 结构损坏。 */
+const val USTAR_SIZE_MAX = 8_589_934_591L
+
 const val MODE_FILE = 420      // 0o644
 const val MODE_DIR = 493       // 0o755
 const val MODE_SYMLINK = 511   // 0o777
@@ -47,7 +52,17 @@ data class Stats(
     val scanSec: Double, val packSec: Double, val totalSec: Double,
     val files: Int, val rawBytes: Long, val written: Long,
     val workers: Int, val window: Int, val pax: Int,
-    val bigFiles: Int, val symlinks: Int
+    val bigFiles: Int, val symlinks: Int,
+    val threshold: Long, val chunkSize: Int,
+    val tuneReason: String?
+)
+
+data class TunedParams(
+    val workers: Int,
+    val threshold: Long,
+    val chunkSize: Int,
+    val window: Int,
+    val reason: String?
 )
 
 fun fmtTime(sec: Double): String {
@@ -58,6 +73,13 @@ fun fmtTime(sec: Double): String {
     val h = m / 60
     val mm = m % 60
     return "$h 时 $mm 分 %.2f 秒".format(s)
+}
+
+fun fmtSize(b: Long): String = when {
+    b < 1024L -> "$b B"
+    b < 1024L * 1024L -> "%.1f KB".format(b / 1024.0)
+    b < 1024L * 1024L * 1024L -> "%.1f MB".format(b / 1024.0 / 1024.0)
+    else -> "%.2f GB".format(b / 1024.0 / 1024.0 / 1024.0)
 }
 
 fun basename(p: String): String {
@@ -75,9 +97,13 @@ fun printUsage() {
 参数:
   <paths...>        要打包的文件或目录（可多个）
   -o, --output      输出 tar 路径；省略则自动推断
-  -j, --workers     读取线程数（默认 8）
-  -w, --window      预取窗口（默认 workers*2）
+  -j, --workers     读取线程数（省略则自动调参）
+  -w, --window      预取窗口（省略则自动调参）
   -h, --help        显示帮助
+
+自动调参:
+  未指定 -j 或 -w 时，扫描完成后根据文件大小分布和可用堆自动选择参数。
+  指定了 -j 或 -w 中任意一个，则全部使用手动值。
 
 输出路径推断规则:
   1. 给了 -o/--output，用它
@@ -85,12 +111,69 @@ fun printUsage() {
   3. 都没有，输出到 ./<第一个输入的 basename>.tar
 
 示例:
-  java -jar ttar.jar ./文件夹/
-  java -jar ttar.jar ./文件夹/ ./其他/
-  java -jar ttar.jar ./文件夹/ 文件名.tar
-  java -jar ttar.jar ./文件夹/ -o /tmp/文件名.tar
+  java -jar ttar.jar ./文件夹名/
+  java -jar ttar.jar ./文件夹名/ ./其他/
+  java -jar ttar.jar ./文件夹名/ 文件夹名.tar
+  java -jar ttar.jar ./文件夹名/ -o /tmp/文件夹名.tar
+  java -jar ttar.jar ./文件夹名/ -j 16 -w 16
         """.trimIndent()
     )
+}
+
+// ---------- 自动调参 ----------
+
+fun autoTune(items: List<Item>): TunedParams {
+    val files = items.filter { !it.isDir && !it.isSymlink }
+    if (files.isEmpty()) {
+        return TunedParams(DEFAULT_WORKERS, BIGFILE_THRESHOLD, CHUNK_SIZE,
+                          DEFAULT_WINDOW, "无文件，使用默认参数")
+    }
+
+    val sizes = files.map { it.size }.sorted()
+    val n = sizes.size
+    val median = sizes[n / 2]
+    val maxSize = sizes[n - 1]
+    val bigCount = files.count { it.size > 8L shl 20 }
+    val bigRatio = bigCount.toDouble() / n
+
+    val rt = Runtime.getRuntime()
+    val availHeap = rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())
+    val heapMb = availHeap / 1024 / 1024
+
+    // 1. 线程数：大文件为主 → 低并发（主循环串行），小文件为主 → 高并发
+    val workers = when {
+        bigRatio > 0.5 -> 6
+        else -> 16
+    }
+
+    // 2. 阈值：堆建议值 vs 最大文件的 1/4，取小
+    //    保证最大的那个文件一定走流式，不占窗口槽位
+    val heapCandidate = when {
+        heapMb < 200 -> 4
+        heapMb < 400 -> 8
+        heapMb < 800 -> 16
+        else -> 32
+    }
+    val maxSizeMb = (maxSize / 1024 / 1024).toInt().coerceAtLeast(1)
+    val thresholdCeiling = maxOf(4, maxSizeMb / 4)
+    val bigfileMb = minOf(heapCandidate, thresholdCeiling)
+    val threshold = bigfileMb.toLong() * 1024 * 1024
+
+    // 3. 块大小：最大文件越大，块越大
+    val chunkMb = when {
+        maxSize < 64L shl 20 -> 4
+        maxSize < 512L shl 20 -> 16
+        else -> 32
+    }
+
+    // 4. 窗口 = 线程数（实测最优，再大反而变慢）
+    val window = workers
+
+    val reason = "文件 $n，中位 ${fmtSize(median)}，最大 ${fmtSize(maxSize)}，" +
+                 "大文件 $bigCount (${"%.1f".format(bigRatio * 100)}%)，" +
+                 "可用堆 ${heapMb} MB"
+
+    return TunedParams(workers, threshold, chunkMb * 1024 * 1024, window, reason)
 }
 
 // ---------- USTAR / PAX ----------
@@ -188,10 +271,17 @@ fun paxLine(key: String, value: String): ByteArray {
     }
 }
 
-fun makePaxEntry(pathValue: String?, linkValue: String?, mtime: Long): ByteArray {
+/**
+ * 构造 PAX 扩展头。
+ * pathValue / linkValue / sizeValue 各自可为 null，只有非 null 的项才会写入。
+ * sizeValue 用于单个文件超过 USTAR_SIZE_MAX 时记录真实大小。
+ */
+fun makePaxEntry(pathValue: String?, linkValue: String?, mtime: Long,
+                 sizeValue: Long? = null): ByteArray {
     var content = ByteArray(0)
     if (pathValue != null) content += paxLine("path", pathValue)
     if (linkValue != null) content += paxLine("linkpath", linkValue)
+    if (sizeValue != null) content += paxLine("size", sizeValue.toString())
     val hdr = makeHeader(
         "PaxHeaders/entry", content.size.toLong(), MODE_FILE, mtime,
         isDir = false, linkname = null, typeflag = TF_PAX
@@ -274,12 +364,11 @@ fun scan(paths: List<String>, arcnames: List<String>): List<Item> {
 // ---------- 主流程 ----------
 fun packFast(
     paths: List<String>, outputPath: String, arcnames: List<String>? = null,
-    workers: Int = DEFAULT_WORKERS, window: Int = 0
+    workersOverride: Int? = null, windowOverride: Int? = null
 ): Stats {
     val t0total = System.nanoTime()
     val arcs = arcnames ?: paths.map { basename(it) }
     if (paths.size != arcs.size) throw IllegalArgumentException("paths 与 arcnames 数量不一致")
-    val win = if (window > 0) window else maxOf(workers * 2, 8)
 
     // ---- 扫描 ----
     val t0scan = System.nanoTime()
@@ -288,7 +377,34 @@ fun packFast(
     val total = items.size
     val scanSec = (System.nanoTime() - t0scan) / 1e9
 
-    val bigCount = items.count { !it.isDir && !it.isSymlink && it.size > BIGFILE_THRESHOLD }
+    // ---- 决定参数 ----
+    val tuned: TunedParams
+    if (workersOverride == null && windowOverride == null) {
+        // 全自动
+        tuned = autoTune(items)
+        System.err.println("自动调参：线程 ${tuned.workers}  " +
+                "阈值 ${tuned.threshold / 1024 / 1024}MB  " +
+                "块 ${tuned.chunkSize / 1024 / 1024}MB  " +
+                "窗口 ${tuned.window}")
+        tuned.reason?.let { System.err.println("  $it") }
+    } else {
+        // 用户手动指定
+        val w = workersOverride ?: DEFAULT_WORKERS
+        tuned = TunedParams(
+            workers = w,
+            threshold = BIGFILE_THRESHOLD,
+            chunkSize = CHUNK_SIZE,
+            window = windowOverride ?: maxOf(w * 2, 8),
+            reason = null
+        )
+    }
+
+    val workers = tuned.workers
+    val win = tuned.window
+    val threshold = tuned.threshold
+    val chunkSize = tuned.chunkSize
+
+    val bigCount = items.count { !it.isDir && !it.isSymlink && it.size > threshold }
     val symCount = items.count { it.isSymlink }
     System.err.println("共 $total 项，扫描耗时 ${fmtTime(scanSec)}" +
         if (symCount > 0) "（含 $symCount 个符号链接）" else "")
@@ -303,7 +419,7 @@ fun packFast(
     var written = 0L
     var lastReport = 0L
 
-    val chunkBuf = ByteArray(CHUNK_SIZE)
+    val chunkBuf = ByteArray(chunkSize)
 
     val ex = Executors.newFixedThreadPool(workers)
     try {
@@ -320,7 +436,7 @@ fun packFast(
 
             fun submit(item: Item): Future<ByteArray>? {
                 if (item.isDir || item.isSymlink) return null
-                if (item.size > BIGFILE_THRESHOLD) return null
+                if (item.size > threshold) return null
                 if (pendingBytes + item.size > pendingByteLimit) return null
                 pendingBytes += item.size
                 return ex.submit(Callable { item.path.readBytes() })
@@ -372,11 +488,19 @@ fun packFast(
                     }
 
                     else -> {
-                        if (needsPaxName(arcname)) {
-                            val pax = makePaxEntry(arcname, null, item.mtime)
+                        // size 超 USTAR 上限时，用 PAX 记录真实 size
+                        val needPaxSize = item.size > USTAR_SIZE_MAX
+                        val needPaxPath = needsPaxName(arcname)
+                        if (needPaxSize || needPaxPath) {
+                            val pax = makePaxEntry(
+                                if (needPaxPath) arcname else null,
+                                null, item.mtime,
+                                if (needPaxSize) item.size else null
+                            )
                             out.write(pax); written += pax.size; paxCount++
                         }
-                        val hdr = makeHeader(arcname, item.size, item.mode, item.mtime,
+                        val hdrSize = if (needPaxSize) 0L else item.size
+                        val hdr = makeHeader(arcname, hdrSize, item.mode, item.mtime,
                                              isDir = false)
                         out.write(hdr); written += hdr.size
 
@@ -395,7 +519,8 @@ fun packFast(
                                     written += n
                                 }
                             }
-                            val pad = (512 - (item.size.toInt() and 511)) and 511
+                            // 用 Long 计算 padding，避免超大文件 toInt() 溢出
+                            val pad = ((512L - (item.size and 511L)) and 511L).toInt()
                             if (pad > 0) { out.write(ZEROS_512, 0, pad); written += pad }
                         }
                         totalBytes += item.size
@@ -423,7 +548,8 @@ fun packFast(
 
     return Stats(
         scanSec, packSec, (System.nanoTime() - t0total) / 1e9,
-        total, totalBytes, written, workers, win, paxCount, bigCount, symCount
+        total, totalBytes, written, workers, win, paxCount, bigCount, symCount,
+        threshold, chunkSize, tuned.reason
     )
 }
 
@@ -433,8 +559,8 @@ fun main(args: Array<String>) {
 
     val paths = mutableListOf<String>()
     var outputPath: String? = null
-    var workers = DEFAULT_WORKERS
-    var window = 0
+    var workers: Int? = null    // null 表示自动
+    var window: Int? = null     // null 表示自动
 
     var i = 0
     while (i < args.size) {
@@ -490,15 +616,18 @@ fun main(args: Array<String>) {
         exitProcess(2)
     }
 
-    val stat = packFast(paths, outputPath, workers = workers, window = window)
+    val stat = packFast(paths, outputPath,
+                        workersOverride = workers,
+                        windowOverride = window)
 
     println("=".repeat(44))
     println("打包完成")
     println("=".repeat(44))
     println("文件/目录项数 : ${stat.files}")
     println("线程数 / 窗口 : ${stat.workers} / ${stat.window}")
+    println("阈值 / 块大小 : ${stat.threshold / 1024 / 1024} MB / ${stat.chunkSize / 1024 / 1024} MB")
     println("PAX 扩展头数  : ${stat.pax}")
-    println("大文件数      : ${stat.bigFiles}（> 8 MB，流式处理）")
+    println("大文件数      : ${stat.bigFiles}")
     println("符号链接数    : ${stat.symlinks}")
     println("原始数据大小 : ${"%,d".format(stat.rawBytes)} 字节 (${"%.2f".format(stat.rawBytes / 1024.0 / 1024.0)} MB)")
     println("tar 大小     : ${"%,d".format(stat.written)} 字节 (${"%.2f".format(stat.written / 1024.0 / 1024.0)} MB)")
